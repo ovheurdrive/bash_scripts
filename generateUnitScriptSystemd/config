@@ -1,0 +1,21 @@
+# Here is an example of config file setting up socat for multicasting 3 unicast channel streams
+
+MASTER_TARGET="socat.target"
+SERVICE_NAME="socat_CHANNEL.service"
+SERVICE_USER="ubuntu"
+FILEPATH="/etc/systemd/system"
+
+COMMAND="\/usr\/bin\/socat -u UDP-LISTEN:PORT,ip-multicast-loop=1 UDP-DATAGRAM:224.10.10.10:PORT"
+
+declare -A CHANNEL_PORT
+CHANNEL_PORT=([40]=1202 \
+              [41]=1203 \
+              [42]=1204 )
+
+declare -A FILE_COMMAND
+for key in "${!CHANNEL_PORT[@]}"
+do
+  formatted_command=$( sed "s/PORT/${CHANNEL_PORT[$key]}/g" <<< $COMMAND )
+  formatted_name=$( sed "s/CHANNEL/$key/g" <<< $SERVICE_NAME )
+  FILE_COMMAND+=([$formatted_name]=$formatted_command)
+done

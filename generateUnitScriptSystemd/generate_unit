@@ -1,0 +1,256 @@
+#!/bin/bash
+
+# Global manual
+
+USAGE="
+Usage : $(basename "$0") [help|generate] [options] -- program to generate unit script
+
+    help       Display this message
+    generate   Generate Unit scripts according to a configuration file
+
+type help <command> for specific help      
+
+Default Config value
+=====================
+
+config    =\"./config\"
+restart   = \"always\"
+user      = \"root\"
+filepath  = \"./test\"
+after     unset
+
+Configuration Template Example
+==============================
+
+MASTER_TARGET=\"master_target.target\"
+declare -A FILE_COMMAND
+FILE_COMMAND=( [file1]=\"command1\" [file2]=\"command2\" )
+
+# RESTART=\"always\"
+# SERVICE_USER=\"ubuntu\"
+# FILEPATH=\"/etc/systemd/system\"
+"
+
+# Generate command manual
+
+GENERATE_USAGE="
+Usage : $(basename "$0") generate [options]
+
+Options :
+========
+
+ --config CONFIGFILE          : specify the path of the config file ( must provide FILE_COMMAND associative array
+                               ([service filename]=command) and MASTER_TARGET the global target filename )
+ 
+ --after SERVICE/TARGET NAME  : specify unit name to wait for
+
+ --before SERVICE/TARGET NAME : specify unit name to launch after
+"
+
+CONFIGFILE="./config"
+RESTART="always"
+SERVICE_USER="root"
+WANTED=""
+FILEPATH="./test"
+
+# Check root permissions (sudo should not be needed in the following systemctl commands thanks to this one)
+
+if [ "$EUID" -ne 0 ]
+  then echo "Please run as root"
+  exit
+fi
+
+err_() {
+    echo "Error on line $1"
+}
+
+trap 'err_ $LINENO' ERR
+
+# Argument parsing
+
+while (( "$#" )); do
+  case "$1" in
+    generate)
+      GENERATE=true
+      shift
+      ;;
+    help)
+      if [[ "$2" == "generate" ]]
+      then
+        echo -e "$GENERATE_USAGE"
+      else
+        echo -e "$USAGE"
+      fi
+      exit
+      ;;
+    --config)
+      CONFIGFILE=$2
+      shift 2
+      ;;
+    --after)
+      if [[ -n "$2" && "$2" != --* ]]
+      then
+        AFTER=$2
+      else
+        echo -e "\n--after option needs an argument" >&2
+        echo -e "$USAGE" >&2
+        exit 1
+      fi
+      shift 2
+      ;;
+    --before)
+      if [[ -n "$2" && "$2" != --* ]]
+      then
+        BEFORE=$2
+      else
+        echo -e "\n--before option needs an argument" >&2
+        echo -e "$USAGE" >&2
+        exit 1
+      fi
+      shift 2
+      ;;
+    --) # end argument parsing
+      shift
+      break
+      ;;
+    -*|--*=) # unsupported flags
+      echo -e "\nError: Unsupported flag $1" >&2
+      echo -e "$USAGE" >&2
+      exit 1
+      ;;
+    *) # preserve positional arguments
+      PARAM="$PARAMS $1"
+      shift
+      ;;
+  esac
+done
+
+set -- $PARAM
+
+# Load configuration file
+
+source $CONFIGFILE
+
+# Check that mandatory arguments are provided
+
+if [[ -z FILE_COMMAND ]]
+then
+  echo -e "You must provide a FILE_COMMAND Associative Array ([service filename]=command)"
+  exit 1
+fi
+if [[ -z MASTER_TARGET ]]
+then 
+  echo -e "You must provide a MASTER_TARGET filename"
+  exit 1
+fi
+
+# Setup the target dependencies
+
+for key in "${!FILE_COMMAND[@]}"
+do
+  WANTED+="$key "
+done
+
+SERVICE_TEMPLATE="\
+[Unit]
+PartOf=$MASTER_TARGET
+
+[Service]
+User=$SERVICE_USER
+ExecStart=COMMAND
+Restart=$RESTART
+StandardInput=null
+StandardOutput=syslog
+StandardError=syslog"
+
+MASTER_TARGET_TEMPLATE="\
+[Unit]
+Wants=$WANTED
+After=AFTER
+Before=BEFORE
+
+[Install]
+WantedBy=multi-user.target"
+
+# Function to write the master target
+
+write_master(){
+  echo -e "$MASTER_TARGET_TEMPLATE" > "$FILEPATH/$MASTER_TARGET"
+  echo -e " --> Master target $MASTER_TARGET created\n"
+  systemctl enable $MASTER_TARGET
+  echo -e " --> Master target $MASTER_TARGET enabled\n"
+}
+
+# Function to write a unit script
+
+write_service(){
+  filename=$1
+  exec_command=$2
+  content=$(sed "s/COMMAND/$exec_command/g" <<< "$SERVICE_TEMPLATE")
+  echo -e "$content" > "$FILEPATH/$filename"
+}
+
+# Main function
+
+setup_init_scripts(){
+
+  # Check the presence of the after argument, and if not there delete the line
+
+  if [[ -z $AFTER ]]
+  then
+    MASTER_TARGET_TEMPLATE=$(echo -e "$MASTER_TARGET_TEMPLATE" | sed '/AFTER/d')
+  else
+    MASTER_TARGET_TEMPLATE=$(sed "s/AFTER/$AFTER/g" <<< "$MASTER_TARGET_TEMPLATE")
+  fi
+
+  # Check the presence of the after argument, and if not there delete the line
+
+  if [[ -z $BEFORE ]]
+  then
+    MASTER_TARGET_TEMPLATE=$(echo -e "$MASTER_TARGET_TEMPLATE" | sed '/BEFORE/d')
+  else
+    MASTER_TARGET_TEMPLATE=$(sed "s/BEFORE/$BEFORE/g" <<< "$MASTER_TARGET_TEMPLATE")
+  fi
+
+  # Check if the provided filepath is writable
+
+  if [[ -w $FILEPATH ]]
+  then
+    echo -e "Putting scripts in $FILEPATH \n"
+  else
+    echo -e "Cannot write in provided file path. Please check your permissions to be able to write in it"
+    exit 1
+  fi
+
+  # Loop over the different unit commands to generate and write the scripts
+
+  for key in "${!FILE_COMMAND[@]}"
+  do
+    write_service "$key" "${FILE_COMMAND[$key]}"
+    echo -e " --> Script $key created\n"
+    systemctl enable $key
+    echo -e " --> Unit $key enabled\n"
+  done
+
+  # Write the master target
+
+  write_master
+
+  # Reload Daemons
+  echo -e "Reloading Daemons ..."
+  systemctl daemon-reload
+  echo -e "Done\n"
+  exit
+}
+
+# Check that we actuelly run a command
+
+if [[ -z $GENERATE ]]
+then
+  echo -e "\nError : \"$1\" cannot be used as primary argument" >&2
+  echo -e "$USAGE" >&2
+  exit 1
+else
+  echo -e "\nSetup of unit script started\n"
+  setup_init_scripts
+fi
