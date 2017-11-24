@@ -1,0 +1,492 @@
+#!/bin/bash
+
+if (( $EUID != 0 )); then
+    echo "$(basename "$0") needs root permissions. Run as root or with sudo"
+    exit 1
+fi
+
+COLUMNS=12
+ELK=0
+S3=0
+GCS=0
+XPACK=0
+CARROT2=0
+NGINX=0
+ES=$(dpkg -l | grep elasticsearch)
+GREEN="\e[32m"
+WHITE="\e[0m"
+
+start(){
+  systemctl start elasticsearch.service
+  systemctl start kibana.service
+}
+
+stop(){
+  systemctl stop elasticsearch.service
+  systemctl stop kibana.service
+}
+
+select_options(){
+    clear
+    echo -e "\n\n\n\n"
+    echo -e $GREEN
+    echo -e " ========================================="
+    echo -e "|                                         |"
+    echo -e "|   ElasticSearch provisionning Script    |"
+    echo -e "|                                         |"
+    echo -e " ========================================="
+    echo -e $WHITE
+    echo -e "\n\n"
+    PS3='Select options to set (or unset): '
+    select opt in "Elasticsearch + Kibana" "S3 snapshot plugin" "GCS snapshot plugin"  "Carrot2 plugin (requires ES 5.5.2)" "Xpack plugin" "Configure Nginx proxy" "Back"
+    do
+        case $REPLY in
+            1)
+                if [[ $ELK -eq 0 ]]; then
+                    echo -e "Setting ELK"
+                    ELK=1
+                else
+                    echo -e "Unsetting ELK"
+                    ELK=0
+                fi
+                ;;
+            2)
+                if [[ $S3 -eq 0 ]]; then
+                    echo -e "Setting S3"
+                    S3=1
+                else
+                    echo -e "Unsetting S3"
+                    S3=0
+                fi
+                ;;
+            3)
+                if [[ $GCS -eq 0 ]]; then
+                    echo -e "Setting GCS"
+                    GCS=1
+                else
+                    echo -e "Unsetting GCS"
+                    GCS=0
+                fi                
+                ;;
+            4)
+                if [[ $CARROT2 -eq 0 ]]; then
+                    echo -e "Setting Carrot2"
+                    CARROT2=1
+                else
+                    echo -e "Unsetting Carrot2"
+                    CARROT2=0
+                fi                
+                ;;
+            5)
+                if [[ $XPACK -eq 0 ]]; then
+                    echo -e "Setting XPACK"
+                    XPACK=1
+                else
+                    echo -e "Unsetting XPACK"
+                    XPACK=0
+                fi
+                ;;
+            6)
+                if [[ $NGINX -eq 0 ]]; then
+                    echo -e "Setting NGINX"
+                    NGINX=1
+                else
+                    echo -e "Unsetting NGINX"
+                    NGINX=0
+                fi
+                ;;
+            7)
+                main_menu
+                ;;
+            *) echo "invalid option";;
+        esac
+    done
+}
+
+install_java(){
+  apt-get update
+  apt-get install default-jre
+  echo "JAVA_HOME=\"/usr/lib/jvm/java-8-openjdk-amd64\"" | tee -a /etc/environment
+  source /etc/environment
+}
+# Install ElasticSearch and Kibana
+
+install_elastic_kibana(){
+    if [ $ES ]; then 
+    CURRENT_ES_VERSION=$(/usr/share/elasticsearch/bin/elasticsearch --version | cut -c10-14)
+    fi
+    if [[ "$CURRENT_ES_VERSION" == $ES_VERSION ]]; then
+        echo "Elasticsearch version $ES_VERSION is already installed"
+    else
+        apt remove --purge elasticsearch kibana
+        wget "https://artifacts.elastic.co/downloads/elasticsearch/elasticsearch-$ES_VERSION.deb"
+        wget "https://artifacts.elastic.co/downloads/kibana/kibana-$ES_VERSION-amd64.deb"
+        apt install /home/ubuntu/elasticsearch-$ES_VERSION.deb
+        apt install /home/ubuntu/kibana-$ES_VERSION-amd64.deb
+    fi
+}
+
+configure_elastic(){
+  # Change Java heap size to half the machine memory
+
+  sed -e '/^-Xm/s/^/#/g' -i /usr/share/elasticsearch/config/jvm.options
+  echo -e "elasticsearch ALL=(ALL) NOPASSWD:/bin/sed" | tee -a /etc/sudoers
+  echo -e "#ES_JAVA_OPTS=" | tee -a /etc/default/elasticsearch
+  echo -e "/usr/bin/sudo /bin/sed -i \"\\\\\$s?.*?ES_JAVA_OPTS=\\\\\"-Xms\$((\$(free -m|awk '/^Mem:/{print \$2}')/2))m -Xmx\$((\$(free -m|awk '/^Mem:/{print \$2}')/2))m\\\\\"?\" /etc/default/elasticsearch" | tee /etc/elasticsearch/es_env.sh
+  sed -i "s?\[Service\]?\[Service\]\nExecStartPre=/bin/bash /etc/elasticsearch/es_env.sh?" /usr/lib/systemd/system/elasticsearch.service
+  # Set host to any
+
+  sed -i "s/#network.host.*/network.host: 0.0.0.0/" /etc/elasticsearch/elasticsearch.yml
+}
+
+install_elk(){
+  install_java
+  install_elastic_kibana
+  configure_elastic
+  setup_unit
+}
+
+setup_unit(){
+  systemctl daemon-reload
+  systemctl enable elasticsearch.service
+  systemctl enable kibana.service
+}
+
+install_s3_plugin(){
+  plugins=$(/usr/share/elasticsearch/bin/elasticsearch-plugin list)
+  for plugin in $plugins; do
+    if [ "$plugin" == "repository-s3" ]; then
+      S3=-1
+    fi
+  done
+  if [ $S3 -eq -1 ]; then
+    echo "S3 plugin already installed"
+  else
+    echo "Enter aws access key :"
+    read AWS_ACCESS_KEY
+    echo "Enter aws secret key :"
+    read AWS_SECRET_KEY
+    /usr/share/elasticsearch/bin/elasticsearch-plugin install repository-s3 --batch 
+    start
+    sleep 60
+    echo -e "Snapshot bucket name :"
+    read S3_BUCKET
+    echo -e "Region :"
+    read REGION
+    echo -e "Snapshot Repository name"
+    read S3_SNAP_NAME
+    curl -XPUT $AUTH "localhost:9200/_snapshot/$S3_SNAP_NAME?verify=false&pretty" -H "Content-Type: application/json" -d"
+    {
+      \"type\": \"s3\",
+      \"settings\": {
+        \"bucket\": \"$S3_BUCKER\",
+        \"region\": \"$REGION\",
+        \"access_key\": \"$AWS_ACCESS_KEY\",
+        \"secret_key\": \"$AWS_SECRET_KEY\"
+      }
+    }"
+    stop
+  fi
+}
+
+# Install Google Cloud Platform repository plugin
+install_gcs_plugin(){
+  plugins=$(/usr/share/elasticsearch/bin/elasticsearch-plugin list)
+  for plugin in $plugins; do
+    if [ "$plugin" == "repository-gcs" ]; then
+      GCS=-1
+    fi
+  done
+  if [ $GCS -eq -1 ]; then
+    echo "GCS plugin already installed"
+  else
+    /usr/share/elasticsearch/bin/elasticsearch-plugin install repository-gcs --batch
+    start
+    sleep 60
+    echo -e "Enter GCS keyfile absolute path:"
+    read GCS_KEY_FILE
+    echo -e "Snapshot bucket name:"
+    read GCS_BUCKET
+    echo -e "Snapshot Repository name:"
+    read GCS_SNAP_NAME
+    /usr/share/elasticsearchbin/elasticsearch-keystore create
+    if [ -f $GCS_KEY_FILE ]; then
+      /usr/share/elasticsearchbin/elasticsearch-keystore add-file gcs.client.$GCS_SNAP_NAME.credentials_file $GCS_KEY_FILE
+    else
+      echo "Error: Cannot configure GCS repository without the credential file"
+      exit 1
+    fi
+    curl -XPUT $AUTH "localhost:9200/_snapshot/$GCS_SNAP_NAME" -H "Content-Type: application/json" -d "
+    {
+      \"type\": \"gcs\",
+      \"settings\": {
+        \"bucket\": \"$GCS_BUCKET\",
+        \"client\": \"$GCS_BUCKET\"
+      }
+    }"
+
+    stop
+  fi
+}
+
+install_carrot2_plugin(){
+
+    plugins=$(/usr/share/elasticsearch/bin/elasticsearch-plugin list)
+    CURRENT_ES_VERSION=$(/usr/share/elasticsearch/bin/elasticsearch --version | cut -c10-14)
+    for plugin in $plugins; do
+        if [ "$plugin" == "org.carrot2:elasticsearch-carrot2:5.5.2" ]; then
+            CARROT2=-1
+        fi
+    done 
+    if [ $CARROT2 -eq -1 ]; then
+        echo -e "Carrot2 plugin already installed"
+    elif [ $CURRENT_ES_VERSION != "5.5.2"]; then
+        echo -e "Sorry, Carrot2 plugin can only be installed on ES version 5.5.2"
+    else
+        /usr/share/elasticsearch/bin/elasticsearch-plugin install  --batch org.carrot2:elasticsearch-carrot2:5.5.2
+    fi
+}
+
+check_xpack(){
+    plugins=$(/usr/share/elasticsearch/bin/elasticsearch-plugin list)
+    for plugin in $plugins; do
+        if [ "$plugin" == "x-pack" ]; then
+            XPACK=-1
+            AUTH="-u $ELASTIC_USER:$ELASTIC_PWD"
+        fi
+    done
+}
+
+# Install X-pack
+install_xpack(){
+  AUTH="-u $ELASTIC_USER:$ELASTIC_PWD"
+  /usr/share/elasticsearch/bin/elasticsearch-plugin install --batch x-pack
+  /usr/share/kibana/bin/kibana-plugin install --batch x-pack 
+}
+
+# Configure X-pack
+
+configure_xpack(){
+  start
+  sleep 60
+  curl -XPUT -u elastic:changeme 'localhost:9200/_xpack/security/user/elastic/_password' -H "Content-Type: application/json" -d '{
+    "password" : "'$ELASTIC_PWD'"
+  }'
+
+  for user in 'kibana' 'logstash_system'
+  do
+    curl -XPUT $AUTH 'localhost:9200/_xpack/security/user/'$user'/_password' -H "Content-Type: application/json" -d '{
+      "password" : "'$ELASTIC_PWD'"
+    }'
+  done
+
+  curl -XPOST $AUTH 'localhost:9200/_xpack/security/role/events_admin' -H "Content-Type: application/json" -d '{
+    "indices" : [
+      {
+        "names" : [ "events*" ],
+        "privileges" : [ "all" ]
+      },
+      {
+        "names" : [ ".kibana*" ],
+        "privileges" : [ "manage", "read", "index" ]
+      }
+    ]
+  }'
+
+  grep -q "xpack.security.audit.enabled: true" /etc/elasticsearch/elasticsearch.yml
+  if [ $? -eq 0 ]; then
+    echo "xpack.security.audit.enabled: true" | tee -a /etc/elasticsearch/elasticsearch.yml
+  fi
+
+  stop
+}
+
+install_xpack_plugin(){
+  echo "Installing X-pack"
+  install_xpack
+  configure_xpack
+}
+
+configure_reverse_proxy(){
+  apt-get install -y nginx 
+  sed -i "s/network.host.*/#network.host: 0.0.0.0/" /etc/elasticsearch/elasticsearch.yml
+
+  echo "events {
+    worker_connections  1024;
+  }
+
+  http {
+
+    upstream elasticsearch {
+      server 127.0.0.1:9200;
+      keepalive 15;
+    }
+
+    upstream kibana {
+      server 127.0.0.1:5601;
+      keepalive 15;
+    }
+
+    server {
+      listen 8080;
+      client_max_body_size 100M;
+      auth_basic \"Protected Elasticsearch\";
+      auth_basic_user_file passwords;
+
+      location / {
+        proxy_pass http://elasticsearch;
+        proxy_redirect off;
+      }
+
+    }
+
+    server {
+      listen 8081;
+      client_max_body_size 100M;
+      auth_basic \"Protected Kibana\";
+      auth_basic_user_file passwords;
+
+      location / {
+        proxy_pass http://kibana;
+        proxy_redirect off;
+      }
+
+    }
+
+  }
+  " | sudo tee -a /etc/nginx/elasticsearch-proxy.conf
+  printf "$ELASTIC_USER:$(openssl passwd -apr1 $ELASTIC_PWD)\n" > /etc/nginx/passwords
+  sed -i "s:/usr/sbin/nginx:/usr/sbin/nginx -c /etc/nginx/elasticsearch-proxy.conf:g" /lib/systemd/system/nginx.service
+  systemctl daemon-reload
+  service nginx restart
+}
+
+install(){
+    echo -e "Installing the following : "
+    if [[ $ELK -eq 1 ]]; then
+        echo " - Elasticsearch and Kibana"
+    fi
+    if [[ $S3 -eq 1 ]]; then
+        echo " - S3 snapshot plugin"
+    fi
+    if [[ $GCS -eq 1 ]]; then
+        echo " - GCS snapshot plugin"
+    fi
+    if [[ $CARROT2 -eq 1 ]]; then
+        echo " - Carrot2 plugin"
+    fi
+    if [[ $XPACK -eq 1 ]]; then
+        echo " - Xpack plugin"
+    fi
+    if [[ $NGINX -eq 1 ]]; then
+        echo " - Configure Nginx proxy"
+    fi
+    echo -e "\n"
+    echo -e "Elasticsearch User: "
+    read ELASTIC_USER
+    echo -e "Elasticsearch Password: "
+    read ELASTIC_PWD
+
+    if [[ $ELK -eq 1 ]]; then
+        echo "Which version do you want to install :"
+        read ES_VERSION
+        install_elk
+    fi
+    check_xpack
+    if [[ $S3 -eq 1 ]]; then
+        install_s3_plugin
+    fi
+    if [[ $GCS -eq 1 ]]; then
+        install_gcs_plugin
+    fi
+    if [[ $CARROT2 -eq 1 ]]; then
+        install_carrot2_plugin
+    fi
+    if [[ $XPACK -eq 1 ]]; then
+        install_xpack_plugin
+    fi
+    if [[ $NGINX -eq 1 ]]; then
+        configure_reverse_proxy
+    fi
+    start
+    echo -e "Installation Successfull. Exiting..."
+    exit 0
+}
+
+upgrade_plugins(){
+  echo "Upgrading plugins"
+  stop
+  plugins=$(/usr/share/elasticsearch/bin/elasticsearch-plugin list)
+  for plugin in $plugins; do
+    /usr/share/elasticsearch/bin/elasticsearch-plugin remove $plugin
+  done
+  for plugin in $plugins; do
+    if [[ $plugin == "elasticsearch-carrot2" ]]; then
+        /usr/share/elasticsearch/bin/elasticsearch-plugin install --batch org.carrot2:elasticsearch-carrot2:5.5.2
+    else
+        /usr/share/elasticsearch/bin/elasticsearch-plugin install --batch $plugin
+    fi
+  done
+  start
+  echo -e "Upgrade Successfull. Exiting..."
+  exit 0
+}
+
+main_menu(){
+    clear
+    echo -e "\n\n\n\n"
+    echo -e $GREEN
+    echo -e " ========================================="
+    echo -e "|                                         |"
+    echo -e "|   ElasticSearch provisionning Script    |"
+    echo -e "|                                         |"
+    echo -e " ========================================="
+    echo -e $WHITE
+    echo -e "\n\n"
+    echo -e "If you want to install something on the server",
+    echo -e "you need to choose options first, this will"
+    echo -e "display you with a menu to set or unset option flags"
+    echo -e "\n"
+    PS3='Select Action: '
+    options=("Choose Options" "Install" "Upgrade Plugins" "Quit")
+    echo -e "Options currently set :\n"
+    if [[ $ELK -eq 1 ]]; then
+        echo " - Install Elasticsearch and Kibana"
+    fi
+    if [[ $S3 -eq 1 ]]; then
+        echo " - Install S3 snapshot plugin"
+    fi
+    if [[ $GCS -eq 1 ]]; then
+        echo " - Install GCS snapshot plugin"
+    fi
+    if [[ $CARROT2 -eq 1 ]]; then
+        echo " - Install Carrot2 plugin"
+    fi
+    if [[ $XPACK -eq 1 ]]; then
+        echo " - Install Xpack plugin"
+    fi
+    if [[ $NGINX -eq 1 ]]; then
+        echo " - Configure Nginx proxy"
+    fi
+    echo -e "\nMenu: \n"
+    select option in "${options[@]}"
+    do
+        case $option in
+            "Choose Options")
+                select_options
+                ;;
+            "Install")
+                install
+                ;;
+            "Upgrade Plugins")
+                upgrade_plugins
+                ;;
+            "Quit")
+                exit 0
+                ;;
+            *) echo "invalid option";;
+        esac
+    done
+}
+
+main_menu
